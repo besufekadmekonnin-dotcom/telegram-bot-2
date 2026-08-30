@@ -27,7 +27,7 @@ from telegram.error import RetryAfter
 # CONFIG
 # ============================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8649753279:AAEJTYur_S1xG1R9AEASH4YvGxTroeOeGYc").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8864950215:AAGa5Tbbxf3NLsUCWszMUTK7e2hsOYvCV6I").strip()
 
 ADMIN_ID = int(
     os.getenv(
