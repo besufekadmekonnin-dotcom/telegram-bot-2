@@ -1,422 +1,1670 @@
-
-import asyncio
-import logging
 import os
+import asyncio
 import secrets
 import sqlite3
-from pathlib import Path
-from threading import Thread
+import re
+import traceback
 
-import requests
-from flask import Flask, abort, Response
-from telegram import Update
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ContextTypes, filters
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
+from telegram.error import RetryAfter
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+BOT_TOKEN = os.getenv(
+    "BOT_TOKEN",
+    "8649753279:AAF11jCO79ltCUNw5Xkw0aTgCUamXlCwQq8"
+).strip()
+
+ADMIN_ID = int(
+    os.getenv(
+        "ADMIN_ID",
+        "6004785454"
+    )
 )
 
-DB_PATH = os.getenv("DB_PATH", "bot.db")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
-PORT = int(os.getenv("PORT", "8080"))
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing. Set it before starting the bot.")
-if not BASE_URL:
-    raise RuntimeError("BASE_URL is missing. Set it to your public HTTPS URL.")
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+STORAGE_CHAT_ID = int(
+    os.getenv(
+        "STORAGE_CHAT_ID",
+        "-1004429842064"
+    )
 )
-log = logging.getLogger(__name__)
 
-app = Flask(__name__)
+DB = "bot.db"
+
+# Telegram fire message effect
+FIRE_EFFECT_ID = "5104841245755180586"
+
+# Channel shown in the /start message
+CHANNEL_USERNAME = "@B16_NETFLIX"
+
+
+# ============================================================
+# DATABASE
+# ============================================================
 
 def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    con = sqlite3.connect(DB)
+    con.row_factory = sqlite3.Row
+    return con
 
-def init_db():
-    conn = db()
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        first_name TEXT,
-        joined_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
 
-    CREATE TABLE IF NOT EXISTS files (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        token TEXT UNIQUE NOT NULL,
-        file_id TEXT NOT NULL,
-        file_name TEXT,
-        mime_type TEXT,
-        size INTEGER,
-        owner_id INTEGER,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        downloads INTEGER DEFAULT 0
-    );
+def setup_db():
+    con = db()
 
-    CREATE TABLE IF NOT EXISTS batches (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        token TEXT UNIQUE NOT NULL,
-        owner_id INTEGER,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        downloads INTEGER DEFAULT 0
-    );
-
-    CREATE TABLE IF NOT EXISTS batch_files (
-        batch_id INTEGER NOT NULL,
-        file_id INTEGER NOT NULL,
-        PRIMARY KEY (batch_id, file_id)
-    );
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY
+        )
     """)
-    conn.commit()
-    conn.close()
 
-def save_user(user):
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS links (
+            token TEXT PRIMARY KEY,
+            link_type TEXT DEFAULT 'single',
+            chat_id TEXT,
+            message_id INTEGER,
+            first_link TEXT,
+            last_link TEXT
+        )
+    """)
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS batch_items (
+            token TEXT,
+            chat_id TEXT,
+            message_id INTEGER,
+            position INTEGER,
+            PRIMARY KEY (token, position)
+        )
+    """)
+
+    columns = [
+        row[1]
+        for row in con.execute(
+            "PRAGMA table_info(links)"
+        ).fetchall()
+    ]
+
+    if "link_type" not in columns:
+        con.execute(
+            "ALTER TABLE links ADD COLUMN link_type TEXT DEFAULT 'single'"
+        )
+
+    if "chat_id" not in columns:
+        con.execute(
+            "ALTER TABLE links ADD COLUMN chat_id TEXT"
+        )
+
+    if "message_id" not in columns:
+        con.execute(
+            "ALTER TABLE links ADD COLUMN message_id INTEGER"
+        )
+
+    if "first_link" not in columns:
+        con.execute(
+            "ALTER TABLE links ADD COLUMN first_link TEXT"
+        )
+
+    if "last_link" not in columns:
+        con.execute(
+            "ALTER TABLE links ADD COLUMN last_link TEXT"
+        )
+
+    con.commit()
+    con.close()
+
+
+# ============================================================
+# MAIN MENU
+# ============================================================
+
+def main_menu():
+    return ReplyKeyboardMarkup(
+        [
+            [
+                KeyboardButton("🎬 Generate file link"),
+                KeyboardButton("📦 Generate batch link"),
+            ],
+            [
+                KeyboardButton("👥 Show users"),
+                KeyboardButton("📊 Bot statistics"),
+            ],
+            [
+                KeyboardButton("📢 Broadcast"),
+                KeyboardButton("🆔 My Telegram ID"),
+            ],
+        ],
+        resize_keyboard=True
+    )
+
+
+# ============================================================
+# START BUTTONS
+# ============================================================
+
+def start_buttons():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "😊 About Me",
+                    callback_data="about",
+                    style="primary"
+                ),
+                InlineKeyboardButton(
+                    "Close 🔒",
+                    callback_data="close",
+                    style="danger"
+                ),
+            ]
+        ]
+    )
+
+
+def about_buttons():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "⬅️ BACK",
+                    callback_data="back_start",
+                    style="primary"
+                ),
+                InlineKeyboardButton(
+                    "Close 🔒",
+                    callback_data="close",
+                    style="danger"
+                ),
+            ]
+        ]
+    )
+
+
+# ============================================================
+# ADMIN
+# ============================================================
+
+def admin_only(update):
+    return (
+        update.effective_user
+        and update.effective_user.id == ADMIN_ID
+    )
+
+
+# ============================================================
+# USER
+# ============================================================
+
+def save_user(user_id):
+    con = db()
+
+    con.execute(
+        """
+        INSERT OR IGNORE INTO users(user_id)
+        VALUES(?)
+        """,
+        (user_id,)
+    )
+
+    con.commit()
+    con.close()
+
+
+def get_user_name(user):
     if not user:
-        return
-    conn = db()
-    conn.execute("""
-        INSERT INTO users(user_id, username, first_name)
-        VALUES (?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            username=excluded.username,
-            first_name=excluded.first_name
-    """, (user.id, user.username or "", user.first_name or ""))
-    conn.commit()
-    conn.close()
+        return "User"
 
-def is_admin(user_id):
-    return ADMIN_ID != 0 and user_id == ADMIN_ID
+    first = (user.first_name or "").strip()
 
-def save_file(file_id, file_name, mime_type, size, owner_id):
-    token = secrets.token_urlsafe(18)
-    conn = db()
-    conn.execute("""
-        INSERT INTO files(token, file_id, file_name, mime_type, size, owner_id)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (token, file_id, file_name or "file", mime_type or "", size or 0, owner_id))
-    conn.commit()
-    conn.close()
-    return token
+    if first:
+        return first
 
-def get_file_by_token(token):
-    conn = db()
-    row = conn.execute("SELECT * FROM files WHERE token=?", (token,)).fetchone()
-    conn.close()
-    return row
+    if user.username:
+        return "@" + user.username
 
-def create_batch(owner_id, file_ids):
-    token = secrets.token_urlsafe(18)
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO batches(token, owner_id) VALUES (?, ?)", (token, owner_id))
-    batch_id = cur.lastrowid
-    cur.executemany(
-        "INSERT INTO batch_files(batch_id, file_id) VALUES (?, ?)",
-        [(batch_id, x) for x in file_ids],
+    return "User"
+
+
+# ============================================================
+# TOKEN
+# ============================================================
+
+def make_token():
+    return secrets.token_urlsafe(18)
+
+
+# ============================================================
+# BOT LINK
+# ============================================================
+
+async def make_link(context, token):
+    bot = await context.bot.get_me()
+
+    return (
+        f"https://t.me/"
+        f"{bot.username}"
+        f"?start={token}"
     )
-    conn.commit()
-    conn.close()
-    return token
 
-def get_batch(token):
-    conn = db()
-    batch = conn.execute("SELECT * FROM batches WHERE token=?", (token,)).fetchone()
-    if not batch:
-        conn.close()
-        return None, []
-    rows = conn.execute("""
-        SELECT f.* FROM files f
-        JOIN batch_files bf ON bf.file_id=f.id
-        WHERE bf.batch_id=?
-        ORDER BY f.id
-    """, (batch["id"],)).fetchall()
-    conn.close()
-    return batch, rows
 
-def tg_file_url(file_id):
-    r = requests.get(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/getFile",
-        params={"file_id": file_id},
-        timeout=30,
+# ============================================================
+# MESSAGE LINK PARSER
+# ============================================================
+
+def extract_message_link(text):
+    if not text:
+        return None
+
+    text = text.strip()
+
+    match = re.search(
+        r"https?://t\.me/c/(\d+)/(\d+)",
+        text
     )
-    r.raise_for_status()
-    data = r.json()
-    if not data.get("ok"):
-        raise RuntimeError(data)
-    path = data["result"]["file_path"]
-    return f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path}"
 
-def stream_telegram_file(row):
-    url = tg_file_url(row["file_id"])
-    r = requests.get(url, stream=True, timeout=60)
-    r.raise_for_status()
+    if match:
+        return {
+            "chat_id": "-100" + match.group(1),
+            "message_id": int(match.group(2)),
+            "type": "private"
+        }
 
-    def generate():
-        for chunk in r.iter_content(chunk_size=1024 * 256):
-            if chunk:
-                yield chunk
+    match = re.search(
+        r"https?://t\.me/([A-Za-z0-9_]+)/(\d+)",
+        text
+    )
 
-    mime = row["mime_type"] or "application/octet-stream"
-    name = row["file_name"] or "file"
-    headers = {
-        "Content-Disposition": f'attachment; filename="{name.replace(chr(34), "")}"'
-    }
-    return Response(generate(), content_type=mime, headers=headers)
+    if match:
+        return {
+            "chat_id": "@" + match.group(1),
+            "message_id": int(match.group(2)),
+            "type": "public"
+        }
 
-@app.get("/f/<token>")
-def download_file(token):
-    row = get_file_by_token(token)
-    if not row:
-        abort(404)
-    conn = db()
-    conn.execute("UPDATE files SET downloads=downloads+1 WHERE id=?", (row["id"],))
-    conn.commit()
-    conn.close()
-    try:
-        return stream_telegram_file(row)
-    except Exception as e:
-        log.exception("Download failed: %s", e)
-        abort(502)
-
-@app.get("/b/<token>")
-def download_batch(token):
-    batch, rows = get_batch(token)
-    if not batch or not rows:
-        abort(404)
-
-    # A batch link opens a simple HTML page listing every file.
-    items = []
-    for row in rows:
-        link = f"{BASE_URL}/f/{row['token']}"
-        name = (row["file_name"] or "file").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        items.append(f'<li><a href="{link}">{name}</a></li>')
-
-    conn = db()
-    conn.execute("UPDATE batches SET downloads=downloads+1 WHERE id=?", (batch["id"],))
-    conn.commit()
-    conn.close()
-
-    html = f"""<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>File Store</title></head>
-<body style="font-family:Arial;max-width:700px;margin:40px auto;padding:20px">
-<h2>📁 File Store</h2><p>Files: {len(rows)}</p><ul>{''.join(items)}</ul>
-</body></html>"""
-    return Response(html, content_type="text/html; charset=utf-8")
-
-def file_info_from_message(message):
-    if message.document:
-        f = message.document
-        return f.file_id, f.file_name or "document", f.mime_type or "application/octet-stream", f.file_size or 0
-    if message.video:
-        f = message.video
-        return f.file_id, "video.mp4", f.mime_type or "video/mp4", f.file_size or 0
-    if message.audio:
-        f = message.audio
-        return f.file_id, message.audio.file_name or "audio", f.mime_type or "audio/mpeg", f.file_size or 0
-    if message.voice:
-        f = message.voice
-        return f.file_id, "voice.ogg", f.mime_type or "audio/ogg", f.file_size or 0
-    if message.photo:
-        f = message.photo[-1]
-        return f.file_id, "photo.jpg", "image/jpeg", f.file_size or 0
     return None
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_user(update.effective_user)
-    await update.message.reply_text(
-        "👋 Welcome to File Store Bot!\n\n"
-        "📁 Send me a file, video, photo or audio and I will save it.\n"
-        "🔗 Reply to the file with /genlink to get a download link.\n"
-        "📦 Use /batchlink to collect multiple files, then /done.\n\n"
-        "Commands:\n"
-        "/id - Show your Telegram ID\n"
-        "/genlink - Generate a file link\n"
-        "/batchlink - Start a batch\n"
-        "/done - Finish a batch\n"
-        "/users - Admin: show users\n"
-        "/stats - Admin: show statistics\n"
-        "/broadcast - Admin: broadcast a message"
+
+# ============================================================
+# SAFE COPY MESSAGE
+# ============================================================
+
+async def safe_copy_message(
+    bot,
+    chat_id,
+    from_chat_id,
+    message_id,
+    max_retries=30
+):
+    retries = 0
+
+    while True:
+        try:
+            return await bot.copy_message(
+                chat_id=chat_id,
+                from_chat_id=from_chat_id,
+                message_id=message_id
+            )
+
+        except RetryAfter as e:
+            retries += 1
+
+            if retries > max_retries:
+                raise
+
+            await asyncio.sleep(
+                max(int(e.retry_after), 1)
+            )
+
+
+# ============================================================
+# FAST BATCH COPY
+# ============================================================
+
+async def copy_range_fast(
+    bot,
+    source_chat_id,
+    storage_chat_id,
+    low,
+    high,
+    token,
+    con
+):
+    position = 1
+    copied = 0
+    failed = 0
+
+    for group_start in range(low, high + 1, 100):
+
+        group_end = min(
+            group_start + 99,
+            high
+        )
+
+        message_ids = list(
+            range(group_start, group_end + 1)
+        )
+
+        group_done = False
+        group_retries = 0
+
+        while not group_done:
+
+            try:
+
+                stored_messages = await bot.copy_messages(
+                    chat_id=storage_chat_id,
+                    from_chat_id=source_chat_id,
+                    message_ids=message_ids
+                )
+
+                for stored in stored_messages:
+
+                    if stored is None:
+                        continue
+
+                    con.execute(
+                        """
+                        INSERT INTO batch_items
+                        (
+                            token,
+                            chat_id,
+                            message_id,
+                            position
+                        )
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (
+                            token,
+                            str(storage_chat_id),
+                            stored.message_id,
+                            position
+                        )
+                    )
+
+                    position += 1
+                    copied += 1
+
+                con.commit()
+                group_done = True
+
+            except RetryAfter as e:
+
+                group_retries += 1
+
+                if group_retries > 30:
+                    break
+
+                await asyncio.sleep(
+                    max(int(e.retry_after), 1)
+                )
+
+            except Exception as e:
+
+                print(
+                    f"GROUP COPY ERROR "
+                    f"{group_start}-{group_end}:",
+                    repr(e)
+                )
+
+                break
+
+        if group_done:
+            continue
+
+        # ====================================================
+        # FALLBACK
+        # ====================================================
+
+        for message_id in message_ids:
+
+            retries = 0
+
+            while True:
+
+                try:
+
+                    stored = await bot.copy_message(
+                        chat_id=storage_chat_id,
+                        from_chat_id=source_chat_id,
+                        message_id=message_id
+                    )
+
+                    con.execute(
+                        """
+                        INSERT INTO batch_items
+                        (
+                            token,
+                            chat_id,
+                            message_id,
+                            position
+                        )
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (
+                            token,
+                            str(storage_chat_id),
+                            stored.message_id,
+                            position
+                        )
+                    )
+
+                    position += 1
+                    copied += 1
+
+                    if copied % 10 == 0:
+                        con.commit()
+
+                    break
+
+                except RetryAfter as e:
+
+                    await asyncio.sleep(
+                        max(int(e.retry_after), 1)
+                    )
+
+                except Exception as e:
+
+                    retries += 1
+
+                    print(
+                        f"MESSAGE {message_id} "
+                        f"ERROR {retries}/5:",
+                        repr(e)
+                    )
+
+                    if retries >= 5:
+                        failed += 1
+                        break
+
+                    await asyncio.sleep(
+                        min(retries * 2, 10)
+                    )
+
+    con.commit()
+
+    return copied, failed
+
+
+# ============================================================
+# START TEXT
+# ============================================================
+
+def start_text(name):
+    return (
+        f"<b>Hello {name},</b>\n\n"
+        "<b>I can store private files in Specified Channel "
+        "and other users can access it from special link.</b>\n\n"
+        f"▌ <b>Check -</b> {CHANNEL_USERNAME}"
     )
 
-async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_user(update.effective_user)
-    await update.message.reply_text(f"🆔 Your Telegram ID: `{update.effective_user.id}`", parse_mode="Markdown")
 
-async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_user(update.effective_user)
-    info = file_info_from_message(update.message)
-    if not info:
+# ============================================================
+# START
+# ============================================================
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if not update.message:
         return
 
-    file_id, name, mime, size = info
-    token = save_file(file_id, name, mime, size, update.effective_user.id)
+    user = update.effective_user
 
-    if context.user_data.get("batch_mode"):
-        context.user_data.setdefault("batch_file_ids", []).append(
-            db_file_id_by_token(token)
-        )
-        await update.message.reply_text(
-            f"✅ Added to batch: {name}\n📦 Files in batch: {len(context.user_data['batch_file_ids'])}"
-        )
-    else:
-        await update.message.reply_text(
-            f"✅ Saved: {name}\n\n"
-            f"Reply to this message with /genlink to create the link."
-        )
-
-def db_file_id_by_token(token):
-    row = get_file_by_token(token)
-    return row["id"]
-
-async def genlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_user(update.effective_user)
-    msg = update.message.reply_to_message
-    if not msg:
-        await update.message.reply_text("⚠️ Reply to a file message with /genlink.")
+    if not user:
         return
 
-    info = file_info_from_message(msg)
-    if not info:
-        await update.message.reply_text("⚠️ The replied message does not contain a supported file.")
+    save_user(user.id)
+
+    name = get_user_name(user)
+
+    # ========================================================
+    # NORMAL /START
+    # ========================================================
+
+    if not context.args:
+
+        try:
+
+            await update.message.reply_text(
+                start_text(name),
+                parse_mode="HTML",
+                reply_markup=start_buttons(),
+                message_effect_id=FIRE_EFFECT_ID
+            )
+
+        except Exception as e:
+
+            print(
+                "START EFFECT ERROR:",
+                repr(e)
+            )
+
+            await update.message.reply_text(
+                start_text(name),
+                parse_mode="HTML",
+                reply_markup=start_buttons()
+            )
+
         return
 
-    # Find an existing record owned by this user, or create one.
-    conn = db()
-    row = conn.execute(
-        "SELECT * FROM files WHERE file_id=? AND owner_id=? ORDER BY id DESC LIMIT 1",
-        (info[0], update.effective_user.id),
+    # ========================================================
+    # LINK /START
+    # ========================================================
+
+    token = context.args[0].strip()
+
+    con = db()
+
+    link = con.execute(
+        """
+        SELECT *
+        FROM links
+        WHERE token=?
+        """,
+        (token,)
     ).fetchone()
-    conn.close()
 
-    if not row:
-        token = save_file(info[0], info[1], info[2], info[3], update.effective_user.id)
-    else:
-        token = row["token"]
+    if not link:
 
-    await update.message.reply_text(f"🔗 File link:\n{BASE_URL}/f/{token}")
+        con.close()
 
-async def batchlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_user(update.effective_user)
-    context.user_data["batch_mode"] = True
-    context.user_data["batch_file_ids"] = []
-    await update.message.reply_text(
-        "📦 Batch mode started.\nSend the files one by one.\nWhen finished, send /done."
-    )
-
-async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("batch_mode"):
-        await update.message.reply_text("ℹ️ No active batch.")
-        return
-
-    ids = context.user_data.get("batch_file_ids", [])
-    if not ids:
-        context.user_data.clear()
-        await update.message.reply_text("⚠️ No files were added.")
-        return
-
-    token = create_batch(update.effective_user.id, ids)
-    context.user_data.clear()
-    await update.message.reply_text(
-        f"📦 Batch created: {len(ids)} files\n\n🔗 {BASE_URL}/b/{token}"
-    )
-
-async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Admin only.")
-        return
-    conn = db()
-    count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    conn.close()
-    await update.message.reply_text(f"👥 Total users: {count}")
-
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Admin only.")
-        return
-    conn = db()
-    users_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    files_count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-    downloads = conn.execute("SELECT COALESCE(SUM(downloads),0) FROM files").fetchone()[0]
-    batches = conn.execute("SELECT COUNT(*) FROM batches").fetchone()[0]
-    conn.close()
-    await update.message.reply_text(
-        f"📊 Statistics\n\n"
-        f"👥 Users: {users_count}\n"
-        f"📁 Files: {files_count}\n"
-        f"📦 Batches: {batches}\n"
-        f"⬇️ Downloads: {downloads}"
-    )
-
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Admin only.")
-        return
-
-    text = " ".join(context.args).strip()
-    if not text and update.message.reply_to_message:
-        text = update.message.reply_to_message.text or update.message.reply_to_message.caption or ""
-
-    if not text:
         await update.message.reply_text(
-            "Usage:\n/broadcast Your message\n\n"
-            "Or reply to a message with /broadcast."
+            f"<b>Hello {name},</b>\n\n"
+            "❌ Link not found.",
+            parse_mode="HTML",
+            reply_markup=start_buttons()
         )
+
         return
 
-    conn = db()
-    rows = conn.execute("SELECT user_id FROM users").fetchall()
-    conn.close()
+    # ========================================================
+    # SINGLE
+    # ========================================================
+
+    if link["link_type"] == "single":
+
+        chat_id = link["chat_id"]
+        message_id = link["message_id"]
+
+        con.close()
+
+        try:
+
+            await safe_copy_message(
+                context.bot,
+                update.effective_chat.id,
+                chat_id,
+                message_id
+            )
+
+        except Exception as e:
+
+            print(
+                "SINGLE SEND ERROR:",
+                repr(e)
+            )
+
+            await update.message.reply_text(
+                "❌ File could not be sent."
+            )
+
+        return
+
+    # ========================================================
+    # BATCH
+    # ========================================================
+
+    items = con.execute(
+        """
+        SELECT *
+        FROM batch_items
+        WHERE token=?
+        ORDER BY position ASC
+        """,
+        (token,)
+    ).fetchall()
+
+    con.close()
+
+    if not items:
+
+        await update.message.reply_text(
+            "❌ Batch is empty.",
+            reply_markup=start_buttons()
+        )
+
+        return
+
+    await update.message.reply_text(
+        f"<b>Hello {name},</b>\n\n"
+        "📦 <b>Batch found!</b>\n\n"
+        f"📁 Messages: {len(items)}\n"
+        "⏳ Sending...",
+        parse_mode="HTML"
+    )
 
     sent = 0
-    for row in rows:
+    failed = 0
+
+    message_ids = [
+        int(item["message_id"])
+        for item in items
+    ]
+
+    for group_start in range(
+        0,
+        len(message_ids),
+        100
+    ):
+
+        group_ids = message_ids[
+            group_start:group_start + 100
+        ]
+
         try:
-            await context.bot.send_message(row["user_id"], text)
-            sent += 1
-            await asyncio.sleep(0.05)
-        except Exception:
-            pass
 
-    await update.message.reply_text(f"📢 Broadcast finished. Sent: {sent}/{len(rows)}")
+            copied_messages = await context.bot.copy_messages(
+                chat_id=update.effective_chat.id,
+                from_chat_id=STORAGE_CHAT_ID,
+                message_ids=group_ids
+            )
 
-def run_web():
-    app.run(host="0.0.0.0", port=PORT, threaded=True)
+            sent += len(
+                [
+                    x for x in copied_messages
+                    if x is not None
+                ]
+            )
 
-def main():
-    init_db()
+        except RetryAfter as e:
 
-    web_thread = Thread(target=run_web, daemon=True)
-    web_thread.start()
+            await asyncio.sleep(
+                max(int(e.retry_after), 1)
+            )
 
-    application = Application.builder().token(BOT_TOKEN).build()
+            try:
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("id", show_id))
-    application.add_handler(CommandHandler("genlink", genlink))
-    application.add_handler(CommandHandler("batchlink", batchlink))
-    application.add_handler(CommandHandler("done", done))
-    application.add_handler(CommandHandler("users", users))
-    application.add_handler(CommandHandler("stats", stats))
-    application.add_handler(CommandHandler("broadcast", broadcast))
+                copied_messages = await context.bot.copy_messages(
+                    chat_id=update.effective_chat.id,
+                    from_chat_id=STORAGE_CHAT_ID,
+                    message_ids=group_ids
+                )
 
-    supported = (
-        filters.Document.ALL
-        | filters.VIDEO
-        | filters.AUDIO
-        | filters.VOICE
-        | filters.PHOTO
+                sent += len(
+                    [
+                        x for x in copied_messages
+                        if x is not None
+                    ]
+                )
+
+            except Exception as e2:
+
+                print(
+                    "GROUP RETRY ERROR:",
+                    repr(e2)
+                )
+
+                for message_id in group_ids:
+
+                    try:
+
+                        await safe_copy_message(
+                            context.bot,
+                            update.effective_chat.id,
+                            STORAGE_CHAT_ID,
+                            message_id
+                        )
+
+                        sent += 1
+
+                    except Exception as e3:
+
+                        print(
+                            "INDIVIDUAL SEND ERROR:",
+                            repr(e3)
+                        )
+
+                        failed += 1
+
+        except Exception as e:
+
+            print(
+                "GROUP SEND ERROR:",
+                repr(e)
+            )
+
+            for message_id in group_ids:
+
+                try:
+
+                    await safe_copy_message(
+                        context.bot,
+                        update.effective_chat.id,
+                        STORAGE_CHAT_ID,
+                        message_id
+                    )
+
+                    sent += 1
+
+                except Exception as e2:
+
+                    print(
+                        "INDIVIDUAL SEND ERROR:",
+                        repr(e2)
+                    )
+
+                    failed += 1
+
+    await update.message.reply_text(
+        "✅ <b>Batch completed!</b>\n\n"
+        f"✅ Sent: {sent}\n"
+        f"❌ Failed: {failed}",
+        parse_mode="HTML",
+        reply_markup=main_menu()
     )
-    application.add_handler(MessageHandler(supported, receive_file))
 
-    log.info("Bot starting...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+# ============================================================
+# CALLBACK BUTTONS
+# ============================================================
+
+async def button_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+
+    if not query:
+        return
+
+    await query.answer()
+
+    user = update.effective_user
+    name = get_user_name(user)
+
+    # ========================================================
+    # ABOUT ME
+    # ========================================================
+
+    if query.data == "about":
+
+        await query.edit_message_text(
+            f"<b>Hello {name},</b>\n\n"
+            "<b>I can store private files in Specified Channel "
+            "and other users can access it from special link.</b>\n\n"
+            "○ Creator: BC\n"
+            "○ Language: Python\n"
+            "○ Library: python-telegram-bot\n"
+            f"○ Channel - {CHANNEL_USERNAME}",
+            parse_mode="HTML",
+            reply_markup=about_buttons()
+        )
+
+        return
+
+    # ========================================================
+    # BACK
+    # ========================================================
+
+    if query.data == "back_start":
+
+        try:
+
+            await query.edit_message_text(
+                start_text(name),
+                parse_mode="HTML",
+                reply_markup=start_buttons()
+            )
+
+        except Exception as e:
+
+            print(
+                "BACK ERROR:",
+                repr(e)
+            )
+
+        return
+
+    # ========================================================
+    # CLOSE
+    # ========================================================
+
+    if query.data == "close":
+
+        try:
+
+            await query.delete_message()
+
+        except Exception as e:
+
+            print(
+                "CLOSE ERROR:",
+                repr(e)
+            )
+
+        return
+
+
+# ============================================================
+# SINGLE LINK BUTTON
+# ============================================================
+
+async def file_link_button(
+    update,
+    context
+):
+    if not admin_only(update):
+
+        await update.message.reply_text(
+            "⛔ ADMIN ONLY"
+        )
+
+        return
+
+    context.user_data.clear()
+    context.user_data["mode"] = "single"
+
+    await update.message.reply_text(
+        "🎬 Send or forward the file now."
+    )
+
+
+# ============================================================
+# BATCH BUTTON
+# ============================================================
+
+async def batch_button(
+    update,
+    context
+):
+    if not admin_only(update):
+
+        await update.message.reply_text(
+            "⛔ ADMIN ONLY"
+        )
+
+        return
+
+    context.user_data.clear()
+    context.user_data["mode"] = "batch_first"
+
+    await update.message.reply_text(
+        "📦 BATCH MODE\n\n"
+        "Send the FIRST Telegram message link."
+    )
+
+
+# ============================================================
+# CREATE SINGLE LINK
+# ============================================================
+
+async def create_single_link(
+    message,
+    context
+):
+    try:
+
+        stored = await safe_copy_message(
+            context.bot,
+            STORAGE_CHAT_ID,
+            message.chat_id,
+            message.message_id
+        )
+
+        storage_chat_id = str(
+            STORAGE_CHAT_ID
+        )
+
+        storage_message_id = stored.message_id
+
+    except Exception as e:
+
+        print(
+            "SINGLE STORAGE ERROR:",
+            repr(e)
+        )
+
+        await message.reply_text(
+            "❌ Could not save the file to storage."
+        )
+
+        return
+
+    key = make_token()
+
+    con = db()
+
+    try:
+
+        con.execute(
+            """
+            INSERT INTO links
+            (
+                token,
+                link_type,
+                chat_id,
+                message_id
+            )
+            VALUES (?, 'single', ?, ?)
+            """,
+            (
+                key,
+                storage_chat_id,
+                storage_message_id
+            )
+        )
+
+        con.commit()
+
+    except Exception as e:
+
+        print(
+            "SINGLE DATABASE ERROR:",
+            repr(e)
+        )
+
+        con.rollback()
+        con.close()
+
+        await message.reply_text(
+            "❌ Could not create the link."
+        )
+
+        return
+
+    con.close()
+
+    link = await make_link(
+        context,
+        key
+    )
+
+    context.user_data.clear()
+
+    await message.reply_text(
+        "✅ FILE LINK CREATED\n\n"
+        f"🔗 {link}",
+        reply_markup=main_menu()
+    )
+
+
+# ============================================================
+# RECEIVE MEDIA
+# ============================================================
+
+async def receive_media(
+    update,
+    context
+):
+    message = update.message
+
+    if not message:
+        return
+
+    if not admin_only(update):
+
+        await message.reply_text(
+            "⛔ ADMIN ONLY"
+        )
+
+        return
+
+    save_user(
+        update.effective_user.id
+    )
+
+    mode = context.user_data.get("mode")
+
+    if mode == "single":
+
+        await create_single_link(
+            message,
+            context
+        )
+
+        return
+
+    await message.reply_text(
+        "ℹ️ Choose an option from the menu.",
+        reply_markup=main_menu()
+    )
+
+
+# ============================================================
+# FIRST LINK
+# ============================================================
+
+async def process_first_link(
+    update,
+    context,
+    text
+):
+    parsed = extract_message_link(text)
+
+    if not parsed:
+
+        await update.message.reply_text(
+            "❌ Invalid Telegram message link.\n\n"
+            "Example:\n"
+            "https://t.me/bekimo/92149"
+        )
+
+        return
+
+    context.user_data["first_link"] = text.strip()
+    context.user_data["first_parsed"] = parsed
+    context.user_data["mode"] = "batch_last"
+
+    await update.message.reply_text(
+        "✅ FIRST LINK SAVED.\n\n"
+        "Now send the LAST Telegram message link."
+    )
+
+
+# ============================================================
+# LAST LINK
+# ============================================================
+
+async def process_last_link(
+    update,
+    context,
+    text
+):
+    parsed = extract_message_link(text)
+
+    if not parsed:
+
+        await update.message.reply_text(
+            "❌ Invalid Telegram message link."
+        )
+
+        return
+
+    first = context.user_data.get("first_parsed")
+    first_link = context.user_data.get("first_link")
+
+    if not first or not first_link:
+
+        context.user_data.clear()
+
+        await update.message.reply_text(
+            "❌ First link is missing."
+        )
+
+        return
+
+    if str(first["chat_id"]) != str(
+        parsed["chat_id"]
+    ):
+
+        await update.message.reply_text(
+            "❌ FIRST and LAST links must "
+            "belong to the same channel."
+        )
+
+        return
+
+    first_id = int(first["message_id"])
+    last_id = int(parsed["message_id"])
+
+    low = min(first_id, last_id)
+    high = max(first_id, last_id)
+
+    source_chat_id = str(first["chat_id"])
+
+    total = high - low + 1
+
+    key = make_token()
+
+    con = db()
+
+    try:
+
+        con.execute(
+            """
+            INSERT INTO links
+            (
+                token,
+                link_type,
+                chat_id,
+                message_id,
+                first_link,
+                last_link
+            )
+            VALUES (?, 'batch', ?, ?, ?, ?)
+            """,
+            (
+                key,
+                str(STORAGE_CHAT_ID),
+                0,
+                first_link,
+                text.strip()
+            )
+        )
+
+        con.commit()
+
+    except Exception as e:
+
+        print(
+            "BATCH DATABASE ERROR:",
+            repr(e)
+        )
+
+        con.rollback()
+        con.close()
+
+        await update.message.reply_text(
+            "❌ Could not create batch."
+        )
+
+        return
+
+    await update.message.reply_text(
+        "⚡ Processing batch...\n\n"
+        f"📁 Messages: {total}\n"
+        "⏳ Please wait..."
+    )
+
+    try:
+
+        copied, failed = await copy_range_fast(
+            bot=context.bot,
+            source_chat_id=source_chat_id,
+            storage_chat_id=STORAGE_CHAT_ID,
+            low=low,
+            high=high,
+            token=key,
+            con=con
+        )
+
+    except Exception as e:
+
+        print(
+            "BATCH CREATION ERROR:",
+            repr(e)
+        )
+
+        traceback.print_exc()
+
+        con.close()
+
+        await update.message.reply_text(
+            "❌ Batch creation failed."
+        )
+
+        return
+
+    con.close()
+
+    bot_link = await make_link(
+        context,
+        key
+    )
+
+    context.user_data.clear()
+
+    await update.message.reply_text(
+        "✅ BATCH LINK CREATED!\n\n"
+        f"▶️ First: {low}\n"
+        f"▶️ Last: {high}\n"
+        f"📁 Stored: {copied}\n"
+        f"❌ Failed: {failed}\n\n"
+        f"🔗 {bot_link}",
+        reply_markup=main_menu()
+    )
+
+
+# ============================================================
+# SHOW USERS
+# ============================================================
+
+async def show_users(
+    update,
+    context
+):
+    if not admin_only(update):
+
+        await update.message.reply_text(
+            "⛔ ADMIN ONLY"
+        )
+
+        return
+
+    con = db()
+
+    count = con.execute(
+        """
+        SELECT COUNT(*)
+        FROM users
+        """
+    ).fetchone()[0]
+
+    con.close()
+
+    await update.message.reply_text(
+        f"👥 TOTAL USERS: {count}"
+    )
+
+
+# ============================================================
+# STATISTICS
+# ============================================================
+
+async def stats(
+    update,
+    context
+):
+    if not admin_only(update):
+
+        await update.message.reply_text(
+            "⛔ ADMIN ONLY"
+        )
+
+        return
+
+    con = db()
+
+    users = con.execute(
+        """
+        SELECT COUNT(*)
+        FROM users
+        """
+    ).fetchone()[0]
+
+    links = con.execute(
+        """
+        SELECT COUNT(*)
+        FROM links
+        """
+    ).fetchone()[0]
+
+    batches = con.execute(
+        """
+        SELECT COUNT(*)
+        FROM links
+        WHERE link_type='batch'
+        """
+    ).fetchone()[0]
+
+    batch_messages = con.execute(
+        """
+        SELECT COUNT(*)
+        FROM batch_items
+        """
+    ).fetchone()[0]
+
+    con.close()
+
+    await update.message.reply_text(
+        "📊 BOT STATISTICS\n\n"
+        f"👥 Users: {users}\n"
+        f"🔗 Links: {links}\n"
+        f"📦 Batches: {batches}\n"
+        f"📁 Batch messages: {batch_messages}"
+    )
+
+
+# ============================================================
+# MY ID
+# ============================================================
+
+async def my_id(
+    update,
+    context
+):
+    await update.message.reply_text(
+        "🆔 Your Telegram ID:\n"
+        f"{update.effective_user.id}"
+    )
+
+
+# ============================================================
+# BROADCAST
+# ============================================================
+
+async def broadcast(
+    update,
+    context
+):
+    if not admin_only(update):
+
+        await update.message.reply_text(
+            "⛔ ADMIN ONLY"
+        )
+
+        return
+
+    context.user_data["mode"] = "broadcast"
+
+    await update.message.reply_text(
+        "📢 Send the broadcast message."
+    )
+
+
+# ============================================================
+# BROADCAST MESSAGE
+# ============================================================
+
+async def broadcast_message(
+    update,
+    context
+):
+    if not admin_only(update):
+        return
+
+    con = db()
+
+    users = con.execute(
+        """
+        SELECT user_id
+        FROM users
+        """
+    ).fetchall()
+
+    con.close()
+
+    sent = 0
+
+    for row in users:
+
+        try:
+
+            await safe_copy_message(
+                context.bot,
+                row["user_id"],
+                update.effective_chat.id,
+                update.message.message_id
+            )
+
+            sent += 1
+
+        except Exception as e:
+
+            print(
+                "BROADCAST ERROR:",
+                repr(e)
+            )
+
+        await asyncio.sleep(0.05)
+
+    context.user_data.clear()
+
+    await update.message.reply_text(
+        "✅ Broadcast finished.\n\n"
+        f"📨 Sent: {sent}",
+        reply_markup=main_menu()
+    )
+
+
+# ============================================================
+# TEXT HANDLER
+# ============================================================
+
+async def text_handler(
+    update,
+    context
+):
+    if not update.message:
+        return
+
+    text = update.message.text or ""
+
+    if text == "🎬 Generate file link":
+
+        await file_link_button(
+            update,
+            context
+        )
+
+        return
+
+    if text == "📦 Generate batch link":
+
+        await batch_button(
+            update,
+            context
+        )
+
+        return
+
+    if text == "👥 Show users":
+
+        await show_users(
+            update,
+            context
+        )
+
+        return
+
+    if text == "📊 Bot statistics":
+
+        await stats(
+            update,
+            context
+        )
+
+        return
+
+    if text == "📢 Broadcast":
+
+        await broadcast(
+            update,
+            context
+        )
+
+        return
+
+    if text == "🆔 My Telegram ID":
+
+        await my_id(
+            update,
+            context
+        )
+
+        return
+
+    mode = context.user_data.get("mode")
+
+    if mode == "batch_first":
+
+        if admin_only(update):
+
+            await process_first_link(
+                update,
+                context,
+                text
+            )
+
+        return
+
+    if mode == "batch_last":
+
+        if admin_only(update):
+
+            await process_last_link(
+                update,
+                context,
+                text
+            )
+
+        return
+
+    if mode == "broadcast":
+
+        await broadcast_message(
+            update,
+            context
+        )
+
+        return
+
+
+# ============================================================
+# ERROR HANDLER
+# ============================================================
+
+async def error_handler(
+    update,
+    context
+):
+    print(
+        "BOT ERROR:",
+        repr(context.error)
+    )
+
+    traceback.print_exc()
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+async def main():
+
+    setup_db()
+
+    if (
+        not BOT_TOKEN
+        or BOT_TOKEN == "PUT_YOUR_BOT_TOKEN_HERE"
+    ):
+
+        raise RuntimeError(
+            "Please set BOT_TOKEN."
+        )
+
+    app = (
+        Application
+        .builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    # ========================================================
+    # COMMANDS
+    # ========================================================
+
+    app.add_handler(
+        CommandHandler(
+            "start",
+            start
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "batch",
+            batch_button
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "genlink",
+            file_link_button
+        )
+    )
+
+    # ========================================================
+    # CALLBACK BUTTONS
+    # ========================================================
+
+    app.add_handler(
+        CallbackQueryHandler(
+            button_callback
+        )
+    )
+
+    # ========================================================
+    # MEDIA
+    # ========================================================
+
+    app.add_handler(
+        MessageHandler(
+            (
+                filters.VIDEO
+                | filters.AUDIO
+                | filters.Document.ALL
+                | filters.PHOTO
+                | filters.Sticker.ALL
+            ),
+            receive_media
+        )
+    )
+
+    # ========================================================
+    # TEXT
+    # ========================================================
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            text_handler
+        )
+    )
+
+    # ========================================================
+    # ERROR
+    # ========================================================
+
+    app.add_error_handler(
+        error_handler
+    )
+
+    print("==============================")
+    print("       BOT IS RUNNING")
+    print("==============================")
+
+    await app.initialize()
+    await app.start()
+
+    if app.updater is None:
+        raise RuntimeError(
+            "Telegram updater is unavailable."
+        )
+
+    await app.updater.start_polling()
+
+    try:
+
+        while True:
+            await asyncio.sleep(3600)
+
+    finally:
+
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+
+
+# ============================================================
+# RUN
+# ============================================================
 
 if __name__ == "__main__":
-    main()
+
+    try:
+
+        asyncio.run(main())
+
+    except KeyboardInterrupt:
+
+        print("Bot stopped.")
