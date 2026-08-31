@@ -27,7 +27,10 @@ from telegram.error import RetryAfter
 # CONFIG
 # ============================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8812925801:AAHHL39hjRz1P99pkJwMZPV5v6adZ6jwZB8").strip()
+BOT_TOKEN = os.getenv(
+    "BOT_TOKEN",
+    "8927756964:AAHI82u0DjdR3R2quMPXvaPpdJZkepPTqxY"
+).strip()
 
 ADMIN_ID = int(
     os.getenv(
@@ -45,8 +48,10 @@ STORAGE_CHAT_ID = int(
 
 DB = "bot.db"
 
+# Telegram fire message effect
 FIRE_EFFECT_ID = "5104841245755180586"
 
+# Channel shown in the /start message
 CHANNEL_USERNAME = "@B16_NETFLIX"
 
 
@@ -423,6 +428,10 @@ async def copy_range_fast(
         if group_done:
             continue
 
+        # ====================================================
+        # FALLBACK
+        # ====================================================
+
         for message_id in message_ids:
 
             retries = 0
@@ -526,6 +535,10 @@ async def start(
 
     name = get_user_name(user)
 
+    # ========================================================
+    # NORMAL /START
+    # ========================================================
+
     if not context.args:
 
         try:
@@ -552,6 +565,10 @@ async def start(
 
         return
 
+    # ========================================================
+    # LINK /START
+    # ========================================================
+
     token = context.args[0].strip()
 
     con = db()
@@ -577,6 +594,10 @@ async def start(
         )
 
         return
+
+    # ========================================================
+    # SINGLE
+    # ========================================================
 
     if link["link_type"] == "single":
 
@@ -606,6 +627,10 @@ async def start(
             )
 
         return
+
+    # ========================================================
+    # BATCH
+    # ========================================================
 
     items = con.execute(
         """
@@ -775,6 +800,10 @@ async def button_callback(
     user = update.effective_user
     name = get_user_name(user)
 
+    # ========================================================
+    # ABOUT ME
+    # ========================================================
+
     if query.data == "about":
 
         await query.edit_message_text(
@@ -790,6 +819,10 @@ async def button_callback(
         )
 
         return
+
+    # ========================================================
+    # BACK
+    # ========================================================
 
     if query.data == "back_start":
 
@@ -809,6 +842,10 @@ async def button_callback(
             )
 
         return
+
+    # ========================================================
+    # CLOSE
+    # ========================================================
 
     if query.data == "close":
 
@@ -1505,10 +1542,13 @@ async def main():
 
     setup_db()
 
-    if not BOT_TOKEN:
+    if (
+        not BOT_TOKEN
+        or BOT_TOKEN == "PUT_YOUR_BOT_TOKEN_HERE"
+    ):
 
         raise RuntimeError(
-            "Please set BOT_TOKEN in Render Environment Variables."
+            "Please set BOT_TOKEN."
         )
 
     app = (
