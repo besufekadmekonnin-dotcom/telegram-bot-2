@@ -4,6 +4,7 @@ import secrets
 import sqlite3
 import re
 import traceback
+import inspect
 
 from telegram import (
     Update,
@@ -29,15 +30,13 @@ from telegram.error import RetryAfter
 
 BOT_TOKEN = os.getenv(
     "BOT_TOKEN",
-    "8927756964:AAHI82u0DjdR3R2quMPXvaPpdJZkepPTqxY"
+    "8778987128:AAG_IjRbwNafV59bKK_pRjvXnvXAVR5ES5M"
 ).strip()
 
-ADMIN_ID = int(
-    os.getenv(
-        "ADMIN_ID",
-        "6004785454"
-    )
-)
+ADMIN_IDS = {
+    6004785454,
+    8760235013,
+}
 
 STORAGE_CHAT_ID = int(
     os.getenv(
@@ -159,19 +158,42 @@ def main_menu():
 # START BUTTONS
 # ============================================================
 
+def colored_button(text, callback_data, style):
+    # Works with both older and newer python-telegram-bot versions.
+    # New versions accept style directly; older versions forward it through api_kwargs.
+    try:
+        params = inspect.signature(InlineKeyboardButton).parameters
+        if "style" in params:
+            return InlineKeyboardButton(
+                text,
+                callback_data=callback_data,
+                style=style
+            )
+        return InlineKeyboardButton(
+            text,
+            callback_data=callback_data,
+            api_kwargs={"style": style}
+        )
+    except Exception:
+        return InlineKeyboardButton(
+            text,
+            callback_data=callback_data
+        )
+
+
 def start_buttons():
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton(
+                colored_button(
                     "😊 About Me",
-                    callback_data="about",
-                    style="primary"
+                    "about",
+                    "primary"
                 ),
-                InlineKeyboardButton(
+                colored_button(
                     "Close 🔒",
-                    callback_data="close",
-                    style="danger"
+                    "close",
+                    "danger"
                 ),
             ]
         ]
@@ -182,15 +204,15 @@ def about_buttons():
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton(
+                colored_button(
                     "⬅️ BACK",
-                    callback_data="back_start",
-                    style="primary"
+                    "back_start",
+                    "primary"
                 ),
-                InlineKeyboardButton(
+                colored_button(
                     "Close 🔒",
-                    callback_data="close",
-                    style="danger"
+                    "close",
+                    "danger"
                 ),
             ]
         ]
@@ -204,7 +226,7 @@ def about_buttons():
 def admin_only(update):
     return (
         update.effective_user
-        and update.effective_user.id == ADMIN_ID
+        and update.effective_user.id in ADMIN_IDS
     )
 
 
